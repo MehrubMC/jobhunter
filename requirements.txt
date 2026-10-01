@@ -1,0 +1,4 @@
+discord.py>=2.4,<3
+requests>=2.32,<3
+python-jobspy>=1.1.80
+python-dotenv>=1.0,<2
