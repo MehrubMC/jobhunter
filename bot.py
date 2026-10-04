@@ -203,6 +203,7 @@ class Job:
     description: str = ""
     from_jobspy: bool = False
     search_term: str = ""        # JobSpy query that found this job
+    salary: str = ""             # pay text if the source gives one, e.g. "$186k/yr"
     category: str = ""           # "SWE", "EE" or "IE", set by passes_filters()
     stack_match: bool = False
     url_key: str = field(init=False)
@@ -301,6 +302,12 @@ def clean_text(raw: str) -> str:
     return _SPACE_RE.sub(" ", raw).strip(" ;")
 
 
+def clean_pay(raw: str) -> str:
+    """Keeps a pay cell only if it looks like pay (has a number, short)."""
+    text = clean_text(raw)
+    return text if re.search(r"\d", text) and len(text) <= 40 else ""
+
+
 _HREF_RE = re.compile(r'href="([^"]+)"', re.I)
 _MD_URL_RE = re.compile(r"\]\((https?://[^)\s]+)\)")
 
@@ -321,7 +328,9 @@ _HEADER_NAMES = {
     "role": {"role", "position", "title"},
     "location": {"location", "locations"},
     "apply": {"apply", "posting", "application", "link"},
+    "salary": {"salary", "pay", "compensation"},          # optional: most lists have none
 }
+_REQUIRED_COLUMNS = ("company", "role", "location", "apply")
 # A job can only ever match a category if its title matches one of these, so rows that
 # don't are dropped before the costly cleanup / hashing.
 _RELEVANT_TITLE_RE = re.compile(
@@ -353,7 +362,7 @@ def _column_map(cells: list[str]) -> dict[str, int] | None:
         for key, options in _HEADER_NAMES.items():
             if name in options and key not in found:
                 found[key] = i
-    return found if found.keys() == _HEADER_NAMES.keys() else None
+    return found if all(k in found for k in _REQUIRED_COLUMNS) else None
 
 
 def _extract_jobs(rows, source: str) -> list[Job]:
@@ -386,8 +395,9 @@ def _extract_jobs(rows, source: str) -> list[Job]:
         company = clean_text(raw_company)
         location = clean_text(cells[colmap["location"]])
         url = extract_apply_url(cells[colmap["apply"]])
+        salary = clean_pay(cells[colmap["salary"]]) if "salary" in colmap else ""
         if company and title and url:
-            jobs.append(Job(company, title, location or "Not listed", url, source))
+            jobs.append(Job(company, title, location or "Not listed", url, source, salary=salary))
     return jobs
 
 
@@ -438,6 +448,38 @@ def _preload_jobspy() -> None:
         import jobspy  # noqa: F401
     except ImportError:
         pass
+
+
+_CURRENCY_SYMBOLS = {"USD": "$", "CAD": "CA$", "GBP": "£", "EUR": "€"}
+_INTERVAL_SUFFIX = {"yearly": "/yr", "hourly": "/hr", "monthly": "/mo", "weekly": "/wk", "daily": "/day"}
+
+
+def _num(value) -> float | None:
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if n != n or n <= 0 else n          # drops NaN / zero
+
+
+def format_pay(rec: dict) -> str:
+    """Builds text like '$25-$35/hr' or '$120k-$150k/yr' from JobSpy's pay columns."""
+    lo, hi = _num(rec.get("min_amount")), _num(rec.get("max_amount"))
+    if lo is None and hi is None:
+        return ""
+    interval = _s(rec.get("interval")).lower()
+    code = (_s(rec.get("currency")) or "USD").upper()
+    symbol = _CURRENCY_SYMBOLS.get(code, f"{code} ")
+
+    def fmt(n: float) -> str:
+        if interval == "yearly" and n >= 1000:
+            return f"{symbol}{n / 1000:g}k"
+        text = f"{n:,.2f}"
+        return symbol + (text[:-3] if text.endswith(".00") else text)
+
+    lo, hi = lo or hi, hi or lo
+    amount = fmt(lo) if lo == hi else f"{fmt(lo)}–{fmt(hi)}"
+    return amount + _INTERVAL_SUFFIX.get(interval, "")
 
 
 _jobspy_lock = threading.Lock()
@@ -509,6 +551,7 @@ def fetch_jobspy_jobs() -> list[Job]:
                     company=company, title=title, location=loc, url=url,
                     source={"linkedin": "LinkedIn", "indeed": "Indeed"}.get(site, site.title() or "JobSpy"),
                     description=_s(rec.get("description"))[:3000],
+                    salary=format_pay(rec),
                     from_jobspy=True,
                     search_term=term,
                 ))
@@ -593,6 +636,7 @@ def build_embed(job: Job) -> discord.Embed:
     embed.add_field(name="Company", value=_trunc(job.company, 1024), inline=True)
     embed.add_field(name="Job Title", value=_trunc(job.title, 1024), inline=True)
     embed.add_field(name="Location", value=_trunc(job.location, 300), inline=False)  # some lists have 30+ cities
+    embed.add_field(name="Pay", value=_trunc(job.salary or "Not listed", 1024), inline=False)
     embed.add_field(name="Source", value=_trunc(job.source, 1024), inline=False)
     if job.category == "SWE" and job.stack_match:
         embed.set_author(name="⭐ React / TypeScript / JavaScript / Frontend match")
@@ -689,13 +733,16 @@ class JobBot(discord.Client):
         batches.append(await jobspy_task)
 
         matched: list[Job] = []
-        batch_keys: set[str] = set()
+        kept: dict[str, Job] = {}                  # url_key / fingerprint -> job already kept
         for job in (j for batch in batches for j in batch):
             if not passes_filters(job):
                 continue
-            if job.url_key in batch_keys or job.fingerprint in batch_keys:
+            twin = kept.get(job.url_key) or kept.get(job.fingerprint)
+            if twin:
+                if job.salary and not twin.salary:  # duplicate from another source has the pay
+                    twin.salary = job.salary
                 continue
-            batch_keys.update((job.url_key, job.fingerprint))
+            kept[job.url_key] = kept[job.fingerprint] = job
             matched.append(job)
 
         new_jobs = [j for j in matched if self.store.is_new(j)]
